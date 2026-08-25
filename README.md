@@ -24,9 +24,9 @@
 | **Parallel fan-out** | Run multiple steps concurrently; merge results downstream |
 | **Persistence** | Checkpoint every step to JSON; resume from last checkpoint on crash |
 | **Retry + backoff** | Exponential backoff per step; configurable attempt count |
-| **Timeout** | Per-step timeouts with `asyncio.wait_for` |
-| **Hooks** | `on_start`, `on_step_complete`, `on_step_fail`, `on_complete`, `on_fail`, `on_cancel` |
-| **Cancel** | Signal cancel at step boundary; clean shutdown |
+| **Timeout** | Per-step timeouts with `asyncio.wait_for`; optional global timeout |
+| **Hooks** | `on_start`, `on_step_start`, `on_step_complete`, `on_step_fail`, `on_complete`, `on_fail` |
+| **Map** | Fan a callback out over a list of items concurrently |
 | **Zero deps** | Pure Python stdlib. `asyncio`, `json`, `pathlib` |
 
 ## Install
@@ -50,8 +50,8 @@ wf.add_step("fetch", fetch_data)
 wf.add_step("process", process_data, deps=["fetch"])
 wf.add_step("save", save_results, deps=["process"])
 
-result = await engine.run(wf.workflow_id)
-print(result)  # output of the last completed step
+result = await engine.run("my-pipeline")
+# result = {"fetch": ..., "process": ..., "save": ...} — keyed by step name
 ```
 
 ### AI Agent Pipeline Example
@@ -121,27 +121,29 @@ engine = WorkflowEngine(persist_dir="./workflows/", hooks=AgentHooks())
 ### Resume After Crash
 
 ```python
-# Workflow crashes at step 3 of 5 — state is saved to disk.
-# Fix the bug. Resume from exactly where it left off:
-result = engine.resume(workflow_id)
-# Steps 1 & 2 are skipped (already completed).
-# Step 3 starts fresh.
+# Workflow crashes at step 3 of 5 — step state is checkpointed to JSON after
+# every step and on every failure. Fix the bug, redeclare the same DAG, and
+# run again: completed steps are skipped, the failed step retries fresh.
+result = await engine.run("my-pipeline")
+# steps 1 & 2 are skipped (already completed); step 3 starts fresh.
 ```
+
+Run `python examples.py` for three end-to-end demos: an AI agent pipeline,
+parallel fan-out with a merge barrier, and crash recovery with resume.
 
 ## Architecture
 
 ```
 WorkflowEngine
   ├── create(name) → Workflow
-  │     └── add_step(id, fn, deps=[...])
+  │     └── add_step(id, fn, deps=[...])   # + add_parallel / add_map
   │
-  ├── run(workflow_id) → result
-  │     ├── _topological_sort()     → step execution order
-  │     ├── _run_step(step)         → execute + retry + timeout
-  │     └── _save_snapshot()       → JSON checkpoint
+  ├── run(name_or_id) → {step: result}
+  │     ├── _topological_sort()   → step execution order
+  │     ├── _execute(step)        → run + retry + timeout
+  │     └── _save_snapshot()      → JSON checkpoint (keyed by name)
   │
-  ├── cancel(workflow_id)           → signal stop at next boundary
-  └── resume(workflow_id)           → restart from last checkpoint
+  └── resume(workflow_id)         → restart from last checkpoint
 ```
 
 ## Ecosystem

@@ -11,6 +11,7 @@ from tiny_workflow_engine import (
     WorkflowError,
     WorkflowHooks,
     WorkflowState,
+    StepStatus,
     _topological_sort,
 )
 
@@ -242,7 +243,11 @@ async def test_persistence_and_resume():
 
 @pytest.mark.asyncio
 async def test_resume_preserves_completed_steps():
-    """Resuming skips already-completed steps and reruns the rest."""
+    """Resume skips already-completed steps and reruns failed/pending ones.
+
+    A workflow whose middle step failed should, on the next run, not re-execute
+    the already-completed steps and retry only the failed step.
+    """
     tmpdir = tempfile.mkdtemp()
     try:
         engine = WorkflowEngine(persist_dir=tmpdir)
@@ -254,18 +259,31 @@ async def test_resume_preserves_completed_steps():
 
         def step_b(input_data, deps):
             calls["b"] += 1
+            if calls["b"] < 2:
+                raise RuntimeError("transient crash")
             return {"b": 2}
 
         wf = engine.create("resume-test")
         wf.add_step("step_a", step_a)
         wf.add_step("step_b", step_b, deps=["step_a"])
-        await engine.run(wf.workflow_id)
+
+        # First attempt: step_a succeeds, step_b fails -> workflow fails.
+        with pytest.raises(WorkflowError):
+            await wf.run()
         assert calls["a"] == 1
         assert calls["b"] == 1
 
-        # Simulate a fresh engine: a new workflow reloads the snapshot.
-        await engine.run(wf.workflow_id)
-        assert calls["a"] == 2  # rerun because a fresh Workflow starts fresh
+        # Simulate a process restart: re-declare the same DAG with the same
+        # workflow id. run() restores the snapshot, skips completed step_a,
+        # and only retries step_b.
+        restarted = engine.create("resume-test")
+        restarted.workflow_id = wf.workflow_id
+        restarted.add_step("step_a", step_a)
+        restarted.add_step("step_b", step_b, deps=["step_a"])
+        result = await restarted.run()
+        assert calls["a"] == 1  # completed step_a not re-executed
+        assert calls["b"] == 2  # failed step_b retried
+        assert result["step_b"] == {"b": 2}
     finally:
         shutil.rmtree(tmpdir)
 

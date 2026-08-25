@@ -221,9 +221,10 @@ class WorkflowEngine:
         _counter[name] = suffix + 1
         return suffix + (max(nums) + 1 if nums else 1)
 
-    def _snapshot_path(self, workflow_id: str) -> Path:
+    def _snapshot_path(self, name: str) -> Path:
         assert self._persist_dir is not None
-        return self._persist_dir / f"{workflow_id}.json"
+        safe = name.replace("/", "_").replace("\\", "_")
+        return self._persist_dir / f"{safe}.json"
 
     def _save_snapshot(self, wf: "Workflow") -> None:
         if self._persist_dir is None:
@@ -249,27 +250,32 @@ class WorkflowEngine:
                 for step in wf.steps.values()
             },
         )
-        path = self._snapshot_path(wf.workflow_id)
+        path = self._snapshot_path(wf.name)
         path.write_text(payload.to_json(), encoding="utf-8")
 
-    def _load_snapshot(self, workflow_id: str) -> Optional[WorkflowSnapshot]:
+    def _load_snapshot(self, name_or_id: str) -> Optional[WorkflowSnapshot]:
         if self._persist_dir is None:
             return None
-        path = self._snapshot_path(workflow_id)
-        if not path.exists():
-            return None
-        with path.open("r", encoding="utf-8") as fh:
-            data = json.load(fh)
-        data["state"] = WorkflowState(data["state"])
-        for step in data["steps"].values():
-            step["status"] = StepStatus(step["status"])
-        return WorkflowSnapshot(
-            workflow_id=data["workflow_id"],
-            name=data["name"],
-            state=data["state"],
-            input_data=data["input_data"],
-            steps=data["steps"],
-        )
+        # Normalize an instance id ("name:3") to its stable name ("name").
+        base = name_or_id.split(":", 1)[0]
+        candidates = [name_or_id, base]
+        for key in candidates:
+            path = self._snapshot_path(key)
+            if not path.exists():
+                continue
+            with path.open("r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            data["state"] = WorkflowState(data["state"])
+            for step in data["steps"].values():
+                step["status"] = StepStatus(step["status"])
+            return WorkflowSnapshot(
+                workflow_id=data["workflow_id"],
+                name=data["name"],
+                state=data["state"],
+                input_data=data["input_data"],
+                steps=data["steps"],
+            )
+        return None
 
     def resume(self, workflow_id: str) -> "Workflow":
         """Reload a previously persisted workflow for re-running."""
@@ -285,16 +291,24 @@ class WorkflowEngine:
             input_data=snapshot.input_data,
         )
         wf._restore(snapshot)
-        self._workflows[workflow_id] = wf
+        self._workflows[snapshot.workflow_id] = wf
         return wf
 
     async def run(
         self, name_or_id: str, input_data: Optional[Dict[str, Any]] = None
     ) -> Dict[str, Any]:
-        """Run a workflow by name or ID and return its per-step results."""
+        """Run a workflow by name or ID and return its per-step results.
+
+        If a persisted checkpoint exists for the workflow name, the run
+        resumes from that checkpoint (already-completed steps are skipped).
+        """
         wf = self._resolve(name_or_id)
         if input_data is not None:
             wf.input_data.update(input_data)
+        # Resume from a checkpoint keyed by the workflow's stable name.
+        snapshot = self._load_snapshot(wf.name)
+        if snapshot is not None and snapshot.workflow_id != wf.workflow_id:
+            wf._restore(snapshot)
         return await wf.run()
 
     def _resolve(self, name_or_id: str) -> "Workflow":
@@ -455,7 +469,15 @@ class Workflow:
     # Execution
     # ------------------------------------------------------------------
     async def run(self) -> Dict[str, Any]:
-        """Run all steps according to their dependency graph."""
+        """Run all steps according to their dependency graph.
+
+        If a persisted snapshot exists for this workflow, completed steps are
+        restored and skipped so the run resumes from the last checkpoint.
+        """
+        snapshot = self._engine._load_snapshot(self.workflow_id)
+        if snapshot is not None:
+            self._restore(snapshot)
+
         if self.state == WorkflowState.COMPLETED:
             return self.results()
         self.state = WorkflowState.RUNNING
