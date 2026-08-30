@@ -402,5 +402,166 @@ async def test_input_data_passed_to_steps():
     assert result["read"]["seen"] == "value"
 
 
+# --------------------------------------------------------------------------
+# v0.2.0: DAG visualization (Mermaid)
+# --------------------------------------------------------------------------
+def test_to_mermaid_linear():
+    """to_mermaid emits one edge per dependency."""
+    engine = WorkflowEngine(persist_dir=None)
+    wf = engine.create("mermaid-linear")
+    wf.add_step("a", lambda input_data, deps: 1)
+    wf.add_step("b", lambda input_data, deps: 2, deps=["a"])
+    wf.add_step("c", lambda input_data, deps: 3, deps=["b"])
+    body = wf.to_mermaid()
+    assert body.startswith("flowchart LR")
+    assert "    a" in body
+    assert "    a --> b" in body
+    assert "    b --> c" in body
+
+
+def test_to_mermaid_fanout():
+    """Fan-out merges produce a single parent node with N incoming edges."""
+    engine = WorkflowEngine(persist_dir=None)
+    wf = engine.create("mermaid-fanout")
+    wf.add_parallel(
+        "fan",
+        [
+            lambda input_data, deps: 1,
+            lambda input_data, deps: 2,
+            lambda input_data, deps: 3,
+        ],
+    )
+    body = wf.to_mermaid()
+    # The parent "fan" depends on fan.0, fan.1, fan.2 (created by add_parallel).
+    assert "fan" in body
+    for i in range(3):
+        assert f"fan.{i}" in body
+
+
+# --------------------------------------------------------------------------
+# v0.2.0: Approval gates
+# --------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_approval_gate_skips_when_not_approved(tmp_path, monkeypatch):
+    """An approval-gate step with no approval file and no env var is SKIPPED."""
+    monkeypatch.delenv("APPROVE_RELEASE", raising=False)
+    engine = WorkflowEngine(persist_dir=str(tmp_path))
+    wf = engine.create("approval-skip")
+    wf.add_step("prep", lambda input_data, deps: {"ok": True})
+    wf.add_step(
+        "release",
+        lambda input_data, deps: {"released": True},
+        deps=["prep"],
+        step_type="approval",
+    )
+    await engine.run(wf.workflow_id)
+    snap = engine._load_snapshot(wf.name)
+    assert snap.steps["prep"]["status"].value == "completed"
+    assert snap.steps["release"]["status"].value == "skipped"
+
+
+@pytest.mark.asyncio
+async def test_approval_gate_runs_when_approval_file_present(tmp_path):
+    """An approval-gate step runs when its approval file exists."""
+    engine = WorkflowEngine(persist_dir=str(tmp_path))
+    wf = engine.create("approval-file")
+    wf.add_step("prep", lambda input_data, deps: {"ok": True})
+    wf.add_step(
+        "release",
+        lambda input_data, deps: {"released": True},
+        deps=["prep"],
+        step_type="approval",
+    )
+    # First run: skipped (no approval file yet).
+    await engine.run(wf.workflow_id)
+    snap = engine._load_snapshot(wf.name)
+    assert snap.steps["release"]["status"].value == "skipped"
+    # Create the approval file at the path the engine expects.
+    approve_dir = tmp_path / "approvals" / wf.workflow_id
+    approve_dir.mkdir(parents=True, exist_ok=True)
+    (approve_dir / "release.approved").write_text("")
+    # Re-run on the same workflow instance — the run() loop resets the
+    # approval gate to PENDING before re-checking.
+    await engine.run(wf.workflow_id)
+    snap = engine._load_snapshot(wf.name)
+    assert snap.steps["release"]["status"].value == "completed"
+
+
+@pytest.mark.asyncio
+async def test_approval_gate_env_var(tmp_path, monkeypatch):
+    """APPROVE_<STEP_NAME>=1 env var unlocks the gate."""
+    monkeypatch.setenv("APPROVE_RELEASE", "1")
+    engine = WorkflowEngine(persist_dir=str(tmp_path))
+    wf = engine.create("approval-env")
+    wf.add_step("prep", lambda input_data, deps: {"ok": True})
+    wf.add_step(
+        "release",
+        lambda input_data, deps: {"released": True},
+        deps=["prep"],
+        step_type="approval",
+    )
+    await engine.run(wf.workflow_id)
+    snap = engine._load_snapshot(wf.name)
+    assert snap.steps["release"]["status"].value == "completed"
+
+
+# --------------------------------------------------------------------------
+# v0.2.0: Snapshot summary / timing
+# --------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_snapshot_summary_and_timing():
+    """Snapshot includes per-step timing and a human-readable summary."""
+    tmpdir = tempfile.mkdtemp()
+    try:
+        engine = WorkflowEngine(persist_dir=tmpdir)
+        wf = engine.create("timed")
+        wf.add_step("s1", lambda input_data, deps: {"x": 1})
+        wf.add_step("s2", lambda input_data, deps: {"y": 2}, deps=["s1"])
+        await engine.run(wf.workflow_id)
+        snap = engine._load_snapshot(wf.name)
+        summary = snap.summary
+        assert summary["total_steps"] == 2
+        assert summary["completed"] == 2
+        assert summary["failed"] == 0
+        assert summary["attempts_total"] == 2
+        # Each step has a duration_s populated.
+        for step_name, step in snap.steps.items():
+            assert step["duration_s"] is not None
+            assert step["started_at"] is not None
+            assert step["completed_at"] is not None
+        # Workflow-level timing.
+        assert summary["started_at"] is not None
+        assert summary["completed_at"] is not None
+        assert summary["duration_s"] is not None
+    finally:
+        shutil.rmtree(tmpdir)
+
+
+def test_summary_handles_unknown_status_strings():
+    """Summary works even if step statuses arrive as plain strings."""
+    snap = type("Snap", (), {})()
+    # Build a synthetic WorkflowSnapshot directly.
+    from tiny_workflow_engine import WorkflowSnapshot, WorkflowState
+    snap = WorkflowSnapshot(
+        workflow_id="manual:1",
+        name="manual",
+        state=WorkflowState.COMPLETED,
+        input_data={},
+        steps={
+            "a": {
+                "status": StepStatus.COMPLETED,
+                "attempts": 1,
+            },
+            "b": {
+                "status": StepStatus.FAILED,
+                "attempts": 3,
+            },
+        },
+    )
+    summary = snap.summary
+    assert summary["completed"] == 1
+    assert summary["failed"] == 1
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

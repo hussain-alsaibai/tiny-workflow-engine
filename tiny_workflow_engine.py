@@ -13,6 +13,7 @@ import asyncio
 import inspect
 import json
 import logging
+import os
 import time
 from dataclasses import asdict, dataclass, field
 from enum import Enum
@@ -106,8 +107,11 @@ class Step:
             ``retry_backoff * (1 << (n - 1))``.
         timeout: Maximum runtime in seconds for a single attempt. ``None``
             means no per-step timeout.
-        step_type: One of ``"task"``, ``"parallel"``, ``"branch"`` or
-            ``"map"``. Informational only; execution does not depend on it.
+        step_type: One of ``"task"``, ``"parallel"``, ``"branch"``,
+            ``"map"`` or ``"approval"``. Informational only, except for
+            ``"approval"``: such steps are checked at run-time and only
+            executed when an approval file or environment variable is present
+            (see :meth:`Workflow._approval_gate`).
         result: The latest successful return value of ``func``.
         error: Message of the last failure, if any.
         attempts: Number of times ``func`` has been invoked.
@@ -124,6 +128,9 @@ class Step:
     result: Any = None
     error: Optional[str] = None
     attempts: int = 0
+    started_at: Optional[float] = None
+    completed_at: Optional[float] = None
+    duration_s: Optional[float] = None
 
 
 @dataclass
@@ -135,6 +142,9 @@ class WorkflowSnapshot:
     state: WorkflowState
     input_data: Dict[str, Any]
     steps: Dict[str, Dict[str, Any]]
+    started_at: Optional[float] = None
+    completed_at: Optional[float] = None
+    duration_s: Optional[float] = None
 
     def to_json(self) -> str:
         payload = asdict(self)
@@ -142,6 +152,32 @@ class WorkflowSnapshot:
         for step in payload["steps"].values():
             step["status"] = StepStatus(step["status"]).value
         return json.dumps(payload, indent=2)
+
+    @property
+    def summary(self) -> Dict[str, Any]:
+        """Return a human-readable summary of the snapshot."""
+        total = len(self.steps)
+        by_status: Dict[str, int] = {}
+        attempts_total = 0
+        for step in self.steps.values():
+            status = step["status"].value if hasattr(step["status"], "value") else step["status"]
+            by_status[status] = by_status.get(status, 0) + 1
+            attempts_total += int(step.get("attempts", 0) or 0)
+        return {
+            "workflow_id": self.workflow_id,
+            "name": self.name,
+            "state": self.state.value,
+            "total_steps": total,
+            "completed": by_status.get("completed", 0) + by_status.get("skipped", 0),
+            "failed": by_status.get("failed", 0),
+            "running": by_status.get("running", 0),
+            "pending": by_status.get("pending", 0),
+            "skipped": by_status.get("skipped", 0),
+            "attempts_total": attempts_total,
+            "started_at": self.started_at,
+            "completed_at": self.completed_at,
+            "duration_s": self.duration_s,
+        }
 
 
 class WorkflowHooks:
@@ -229,6 +265,7 @@ class WorkflowEngine:
     def _save_snapshot(self, wf: "Workflow") -> None:
         if self._persist_dir is None:
             return
+        now = time.time()
         payload = WorkflowSnapshot(
             workflow_id=wf.workflow_id,
             name=wf.name,
@@ -246,9 +283,19 @@ class WorkflowEngine:
                     "result": step.result,
                     "error": step.error,
                     "attempts": step.attempts,
+                    "started_at": getattr(step, "started_at", None),
+                    "completed_at": getattr(step, "completed_at", None),
+                    "duration_s": getattr(step, "duration_s", None),
                 }
                 for step in wf.steps.values()
             },
+            started_at=wf._started_at,
+            completed_at=wf._completed_at,
+            duration_s=(
+                (wf._completed_at - wf._started_at)
+                if (wf._started_at is not None and wf._completed_at is not None)
+                else None
+            ),
         )
         path = self._snapshot_path(wf.name)
         path.write_text(payload.to_json(), encoding="utf-8")
@@ -274,6 +321,9 @@ class WorkflowEngine:
                 state=data["state"],
                 input_data=data["input_data"],
                 steps=data["steps"],
+                started_at=data.get("started_at"),
+                completed_at=data.get("completed_at"),
+                duration_s=data.get("duration_s"),
             )
         return None
 
@@ -343,6 +393,8 @@ class Workflow:
         self.input_data: Dict[str, Any] = input_data or {}
         self.state = WorkflowState.PENDING
         self.global_timeout: Optional[float] = None
+        self._started_at: Optional[float] = None
+        self._completed_at: Optional[float] = None
 
     # ------------------------------------------------------------------
     # Construction helpers
@@ -473,14 +525,36 @@ class Workflow:
 
         If a persisted snapshot exists for this workflow, completed steps are
         restored and skipped so the run resumes from the last checkpoint.
+
+        Steps whose ``step_type`` is ``"approval"`` are only executed when an
+        approval file or matching environment variable is present; otherwise
+        they are recorded as :attr:`StepStatus.SKIPPED` and downstream
+        steps still receive their result slot (set to ``None``).
         """
         snapshot = self._engine._load_snapshot(self.workflow_id)
         if snapshot is not None:
             self._restore(snapshot)
 
+        # If the workflow previously completed but contained approval-gate
+        # steps that were skipped, allow the operator to re-trigger those
+        # gates by simply re-running. We reset those steps to PENDING so
+        # the gate check below can flip them to COMPLETED on this run.
         if self.state == WorkflowState.COMPLETED:
-            return self.results()
+            has_skipped_approval = any(
+                step.step_type == "approval" and step.status == StepStatus.SKIPPED
+                for step in self.steps.values()
+            )
+            if not has_skipped_approval:
+                return self.results()
+            for step in self.steps.values():
+                if step.step_type == "approval" and step.status == StepStatus.SKIPPED:
+                    step.status = StepStatus.PENDING
+                    step.result = None
+                    step.error = None
+            self.state = WorkflowState.PENDING
         self.state = WorkflowState.RUNNING
+        if self._started_at is None:
+            self._started_at = time.time()
         self._engine._save_snapshot(self)
         await self._call_hook(
             self._hooks_instance.on_start, (self, self._snapshot())
@@ -501,6 +575,26 @@ class Workflow:
                     )
                 step = self.steps[step_id]
                 if step.status == StepStatus.COMPLETED:
+                    # Re-add to completed so resumed runs include it in result.
+                    completed[step.name] = step.result
+                    continue
+                # Approval-gate steps are re-evaluated on every run: a prior
+                # SKIPPED status is reset so the gate can flip to APPROVED
+                # once the approval file or env var is supplied.
+                if step.step_type == "approval":
+                    step.status = StepStatus.PENDING
+                    step.result = None
+                    step.error = None
+                if step.status == StepStatus.SKIPPED:
+                    completed[step.name] = step.result
+                    continue
+                # Approval gate: skip when not approved.
+                if not await self._approval_gate(step):
+                    step.status = StepStatus.SKIPPED
+                    step.error = "not approved"
+                    step.result = None
+                    self._engine._save_snapshot(self)
+                    completed[step.name] = None
                     continue
                 await self._execute(step, completed)
                 if step.status == StepStatus.COMPLETED:
@@ -520,19 +614,47 @@ class Workflow:
         except WorkflowError as exc:
             if self.state != WorkflowState.FAILED:
                 self.state = WorkflowState.FAILED
+            self._completed_at = time.time()
             self._engine._save_snapshot(self)
             raise exc
         except asyncio.TimeoutError:
             self.state = WorkflowState.FAILED
+            self._completed_at = time.time()
             self._engine._save_snapshot(self)
             raise WorkflowError("Workflow global timeout exceeded")
 
         self.state = WorkflowState.COMPLETED
+        self._completed_at = time.time()
         self._engine._save_snapshot(self)
         await self._call_hook(
             self._hooks_instance.on_complete, (self, self._snapshot())
         )
         return {k: v for k, v in completed.items()}
+
+    async def _approval_gate(self, step: Step) -> bool:
+        """Check if a step is approved.
+
+        For non-approval steps this returns ``True`` unconditionally. For
+        ``step.step_type == "approval"`` steps the gate checks for the
+        existence of an approval file under the engine's ``persist_dir`` and
+        falls back to a matching ``APPROVE_<STEP_NAME>`` environment
+        variable. Use :mod:`cli` (``twf --approve workflow/step``) to
+        create the approval file.
+        """
+        if step.step_type != "approval":
+            return True
+        if self._engine._persist_dir is None:
+            return False
+        approval_path = (
+            Path(self._engine._persist_dir)
+            / "approvals"
+            / self.workflow_id.replace("/", "_")
+            / f"{step.name}.approved"
+        )
+        env_key = f"APPROVE_{step.name.upper()}"
+        if approval_path.exists():
+            return True
+        return os.environ.get(env_key) == "1"
 
     def _cutoff_reached(self, start: float) -> bool:
         if self.global_timeout is None:
@@ -547,6 +669,7 @@ class Workflow:
         await self._call_hook(
             self._hooks_instance.on_step_start, (self, step.name)
         )
+        step.started_at = time.time()
         for attempt in range(step.retry_count + 1):
             step.attempts = attempt + 1
             step.status = StepStatus.RUNNING
@@ -571,6 +694,8 @@ class Workflow:
                 step.result = result
                 step.status = StepStatus.COMPLETED
                 step.error = None
+                step.completed_at = time.time()
+                step.duration_s = step.completed_at - (step.started_at or step.completed_at)
                 self._engine._save_snapshot(self)
                 await self._call_hook(
                     self._hooks_instance.on_step_complete,
@@ -584,6 +709,8 @@ class Workflow:
                     await asyncio.sleep(delay)
                     continue
                 step.status = StepStatus.FAILED
+                step.completed_at = time.time()
+                step.duration_s = step.completed_at - (step.started_at or step.completed_at)
                 self._engine._save_snapshot(self)
                 await self._call_hook(
                     self._hooks_instance.on_step_fail,
@@ -608,6 +735,36 @@ class Workflow:
             if step.status == StepStatus.COMPLETED
         }
 
+    def to_mermaid(self) -> str:
+        """Return a Mermaid flowchart diagram of the workflow DAG.
+
+        Useful for rendering dependency graphs inline in Markdown, PR
+        descriptions, or any Mermaid-aware viewer. The output uses
+        ``flowchart LR`` (left-to-right) and emits one ``A --> B`` line per
+        dependency edge, so fan-in nodes appear as multiple separate edges
+        instead of an ambiguous chain.
+
+        Example:
+            >>> wf = Workflow(...)
+            >>> print(wf.to_mermaid())
+            flowchart LR
+                fetch
+                fetch --> process
+                process --> save
+        """
+        lines = ["flowchart LR"]
+        seen_nodes: set = set()
+        # First pass: declare nodes that have no incoming edges.
+        for step in self.steps.values():
+            if not step.deps:
+                lines.append(f"    {step.name}")
+                seen_nodes.add(step.name)
+        # Second pass: emit one edge per dependency.
+        for step in self.steps.values():
+            for dep in step.deps:
+                lines.append(f"    {dep} --> {step.name}")
+        return "\n".join(lines)
+
     def _snapshot(self) -> WorkflowSnapshot:
         return WorkflowSnapshot(
             workflow_id=self.workflow_id,
@@ -626,11 +783,35 @@ class Workflow:
                     "result": step.result,
                     "error": step.error,
                     "attempts": step.attempts,
+                    "started_at": getattr(step, "started_at", None),
+                    "completed_at": getattr(step, "completed_at", None),
+                    "duration_s": getattr(step, "duration_s", None),
                 }
                 for step in self.steps.values()
             },
+            started_at=self._started_at,
+            completed_at=self._completed_at,
+            duration_s=(
+                (self._completed_at - self._started_at)
+                if (self._started_at is not None and self._completed_at is not None)
+                else None
+            ),
         )
 
     @property
     def _hooks_instance(self) -> WorkflowHooks:
         return self._engine._hooks
+
+
+# ---------------------------------------------------------------------------
+# Console-script entry point: ``twf``.
+#
+# The CLI lives in a separate ``cli.py`` to keep ``tiny_workflow_engine.py``
+# focused on the library API. We re-export it under the attribute name
+# ``cli`` so that the ``[project.scripts]`` entry in ``pyproject.toml``
+# (``twf = "tiny_workflow_engine:cli"``) can locate it.
+# ---------------------------------------------------------------------------
+try:  # pragma: no cover - import side effect
+    from cli import main as cli  # type: ignore
+except ImportError:  # pragma: no cover - the module may not be installed
+    cli = None  # type: ignore[assignment]
