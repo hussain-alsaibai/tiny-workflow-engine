@@ -49,7 +49,8 @@
 ## Install
 
 ```bash
-pip install tiny-workflow-engine
+# From GitHub (recommended -- not yet on PyPI)
+pip install git+https://github.com/hussain-alsaibai/tiny-workflow-engine.git
 ```
 
 Or copy `tiny_workflow_engine.py` (and optionally `cli.py`) — zero dependencies.
